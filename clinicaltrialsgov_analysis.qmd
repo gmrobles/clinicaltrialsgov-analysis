@@ -1,0 +1,824 @@
+---
+title: Analyzing all the clinical trials started between 2010-2021 that match Novartis's therapeutic areas
+subtitle: ClinicalTrials.gov data engineering and analysis workflow in R
+title-block-banner: true
+author: Guillermo M. Robles
+date: "`r Sys.Date()`"
+abstract: |
+  This analysis has been developed as a fun weekend project to showcase my data science skills, with an emphasis on data engineering and visualization with R. Using data obtained through ClinicalTrials.gov's API, I show how to set up a robust and modern data analysis pipeline in a short amount of time to get immediate and (hopefully) visually appealing results.
+format:
+  html:
+    theme: materia
+    page-layout: article
+    number-sections: true
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    code-fold: true
+    anchor-sections: true
+execute:
+  echo: false
+  warning: false
+editor: source
+---
+
+```{r}
+#| label: load-packages
+
+library(tidyverse)
+library(lubridate)
+library(glue)
+library(scales)
+library(jsonlite)
+library(tidytext)
+library(gt)
+library(gtExtras)
+library(plotly)
+library(leaflet)
+library(rgdal)
+library(countrycode)
+library(hrbrthemes)
+library(ggridges)
+```
+
+```{r}
+#| label: set-ggplot2-defaults
+
+theme_set(theme_ipsum_rc())
+
+theme_update(plot.margin = grid::unit(rep(3, 4), "mm"))
+```
+
+# Motivation
+
+Last week, after realizing that I couldn't show any of the projects I've been involved with for confidential reasons, I decided that it would be a great idea to build a quick project to put on display while I assemble a more solid portfolio. As a constraint (and also because, frankly, I don't have a lot of free time these days), I chose to give myself only one weekend to work on it, from getting and cleaning the data to analyzing it and producing some results.
+
+Speaking about the data, I wanted to choose something relevant to the field I'm interested in (the intersection between Biostatistics and Data science) and that would offer some challenge, instead of downloading a random dataset. After thinking hard about it, I settled on the following process: I researched [Novartis's main therapeutic areas of focus](https://www.novartis.com/us-en/about/novartis-us/company-glance/research-and-development/therapeutic-areas) and downloaded information about hundreds of thousands of clinical trials related to these areas.
+
+According to this, I've divided the remainder of the article in two parts:
+
+1.  [Data engineering](#sec-data-engineering), where I explain the strategy I've used to select, download and process the data.
+2.  [Data visualization](#sec-data-visualization), where I show different ways and methods of representing the relationship between different variables to help us better understand the data, discover insights and maybe even point to new questions to explore in the future.
+
+::::{.column-margin}
+
+:::{.callout-note}
+
+If you're not terribly interested about how the data was gathered or don't have the time to read the whole thing, the [data visualization section](#sec-data-visualization) is the most noteworthy one!
+
+:::
+
+::::
+
+The code used to build this website is available as a single [Quarto document](https://quarto.org/) [on GitHub](https://github.com/gmrobles/clinicaltrialsgov-analysis). Additionally (and unrelated to this project), I've also made public a [Shiny app](https://gmrobles.shinyapps.io/adenomapp_en) I developed to deploy a machine learning model to predict if a patient has a specific type of cancer.
+
+# Data engineering {#sec-data-engineering}
+
+Novartis lists its main therapeutic areas in [multiple](https://www.novartis.com/us-en/about/novartis-us/company-glance/research-and-development/therapeutic-areas) [websites](https://www.novartis.com/research-development/research-disease-areas). Although it's difficult to summarize such a large offering of treatments, pharmaceuticals and fields of research, I think the following list is a good compromise for the purposes of this analysis:
+
+-   Cardio Metabolic
+-   Ophthalmology
+-   Respiratory
+-   Neuroscience
+-   Immunology and Dermatology
+-   Oncology
+-   Cell and Gene Therapy
+-   Tropical Diseases
+
+Now that we have narrowed down the fields we're interested in, we *only* need to get all the possible clinical trials related to them. To do so, we will use ClinicalTrials.gov, which in addition to being the largest clinical trials database in the world also has a [useful and comprehensive API](https://www.clinicaltrials.gov/api/gui/home).
+
+ClinicalTrials.gov's API allows us not only to make a very refined search but also to select which fields from the clinical trial record to get information from.
+
+The table below lists which search terms have been used to retrieve clinical trials records from each therapeutic area:
+
+[The search terms are combination of the diseases specifically mentioned on Novartis's website and relevant conditions on [ClinicalTrials.gov's list of topics.](https://clinicaltrials.gov/ct2/search/browse?brwse=cond_cat)]{.aside}
+
+| Novartis's therapeutic area  | Search term used on ClinicalTrials.gov                                                             |
+|-----------------------|-------------------------------------------------|
+| Cardio Metabolic           | Vascular Diseases `OR` Heart Diseases `OR` Kidney Diseases `OR` Liver Diseases                     |
+| Ophthalmology              | ophthalmology `OR` ophthalmic                                                                      |
+| Respiratory                | Respiratory Tract Diseases `OR` copd `OR` chronic obstructive pulmonary disease `OR` severe asthma |
+| Neuroscience               | alzheimer `OR` parkinson `OR` multiple sclerosis `OR` epilepsy `OR` adhd                           |
+| Immunology and Dermatology | Immune System Diseases `OR` Autoimmune Diseases `OR` Skin Diseases                                 |
+| Oncology                   | oncology                                                                                           |
+| Cell and Gene Therapy      | cell therapy `OR` gene therapy                                                                     |
+| Tropical Diseases          | tropical `AND` (disease `OR` diseases)          
+
+To further restrict the search to get relevant results, the following parts were added to the query:
+
+* `AREA[StudyType]Interventional`: to get only clinical trials.
+* `AREA[StartDate]RANGE[01/01/2010, 31/12/2021]`: to get clinical trials started between 2010 and 2021.
+
+
+```{r}
+#| label: custom-functions
+
+# Function to get the summary stats for the search expression
+get_n_total_studies <- function(search_expression) {
+  
+  search_expression <- search_expression |> 
+    str_replace_all(" ", "+")
+  
+  url_json <- glue("https://www.clinicaltrials.gov/api/query/study_fields?expr={ search_expression }&fields=&min_rnk=1&max_rnk=1&fmt=json")
+  
+  results_json <- fromJSON(url_json)
+  
+  results_json[[c("StudyFieldsResponse", "NStudiesFound")]]
+  
+}
+
+# Function to get max specified number of studies
+get_ctgov_data <- function(search_expression,
+                           study_fields,
+                           min_rnk = 1,
+                           max_rnk,
+                           delay_seconds = 10) {
+  
+  search_expression <- search_expression |> str_replace_all(" ", "+")
+  
+  study_fields <- study_fields |> paste0(collapse = "%2C")
+  
+  rnk_seq <- seq(from = min_rnk, to = max_rnk, by = 1000)
+  
+  min_rnk_total <- c(min_rnk, rnk_seq[-1])
+  
+  max_rnk_total <- c(rnk_seq[-1] - 1, max_rnk)
+  
+  df_list <- vector(mode = "list", length = length(min_rnk_total))
+  
+  df_list <- map2(
+    min_rnk_total, max_rnk_total, slowly(~ {
+      
+      message(glue("Downloding ranks { .x } to { .y }"))
+      
+      results_json <- fromJSON(glue("https://www.clinicaltrials.gov/api/query/study_fields?expr={ search_expression }&fields={ study_fields }&min_rnk={ .x }&max_rnk={ .y }&fmt=json"))
+      
+      results_json[["StudyFieldsResponse"]][["StudyFields"]]
+      
+    }, rate = rate_delay(delay_seconds))
+  ) |> 
+    bind_rows()
+  
+  df_list
+
+}
+```
+
+```{r}
+#| label: get-raw-data
+#| eval: false
+
+# Initial parameters
+
+# Important: Only up to 20 study fields can be selected before the API returns an error
+study_fields <- c("NCTId", "OfficialTitle", "BriefSummary", "Condition", "StudyType", "Phase", "Gender", "MinimumAge", "MaximumAge", "LeadSponsorName", "EnrollmentCount", "DesignInterventionModel", "DesignPrimaryPurpose", "ArmGroupInterventionName", "HealthyVolunteers", "LocationCountry", "StartDate", "CompletionDate", "WhyStopped", "RetractionPMID")
+
+# Table with the all the necessary information to get the data
+nov_ta_exprs_df <- 
+  tibble(
+  nov_therapeutic_area = c("Cardio Metabolic", "Ophthalmology", "Respiratory", "Neuroscience", "Immunology and Dermatology", "Oncology", "Cell and Gene Therapy", "Tropical Diseases"),
+  search_terms = c("Vascular Diseases OR Heart Diseases OR Kidney Diseases OR Liver Diseases", "ophthalmology OR ophthalmic", "Respiratory Tract Diseases OR copd OR chronic obstructive pulmonary disease OR severe allergic asthma OR severe asthma", "alzheimer OR parkinson OR multiple sclerosis OR epilepsy OR adhd", "Immune System Diseases OR Autoimmune Diseases OR Skin Diseases", "oncology", "cell therapy OR gene therapy", "tropical AND (disease OR diseases)")
+) |> 
+  mutate(search_expression = glue("AREA[StudyType]Interventional AND AREA[StartDate]RANGE[01/01/2010, 31/12/2021] AND ({ search_terms })"),
+         n_available_studies = map_int(search_expression, get_n_total_studies))
+
+# Get all the raw ClinicalTrials.gov data for the Therapeutic Areas
+ctgov_data_raw <- 
+  nov_ta_exprs_df |> 
+  mutate(data_raw = map2(search_expression, n_available_studies, ~{
+    get_ctgov_data(
+      search_expression = .x,
+      study_fields = study_fields,
+      max_rnk = .y,
+      delay_seconds = 1
+    )
+  }))
+
+# Save the raw data to an RDS object
+ctgov_data_raw |> saveRDS("data/ctgov_data_raw.rds")
+```
+
+```{r}
+#| label: clean-data
+#| eval: false
+
+# Load the raw data saved in the RDS object
+
+ctgov_data_raw <- readRDS("data/ctgov_data_raw.rds")
+
+ctgov_data_raw <- 
+  ctgov_data_raw |> 
+  unnest(cols = data_raw)
+
+ctgov_data_clean <- 
+  ctgov_data_raw |> 
+  select(-c(search_terms, search_expression)) |> 
+  group_by(NCTId) |> 
+  mutate(n_therapeutic_areas = n(),
+         nov_therapeutic_area_total = paste0(nov_therapeutic_area, collapse = ", ")) |> 
+  ungroup() |> 
+  unnest(cols = c(NCTId, OfficialTitle, BriefSummary, LeadSponsorName, MinimumAge, MaximumAge, Gender, EnrollmentCount, WhyStopped),
+         keep_empty = TRUE) |> 
+  mutate(nov_therapeutic_area = factor(nov_therapeutic_area, levels = nov_ta_exprs_df$nov_therapeutic_area),
+         LocationCountry = map(LocationCountry, unique),
+         StartDate_clean = mdy(StartDate),
+         CompletionDate_clean = mdy(CompletionDate),
+         start_year = year(StartDate_clean),
+         EnrollmentCount_clean = parse_number(EnrollmentCount),
+         MinimumAge_clean = case_when(
+           str_detect(MinimumAge, "Minute|Hour|Day|Week") ~ 0,
+           str_detect(MinimumAge, "Month") &
+             parse_number(MinimumAge) < 12 ~ 0,
+           str_detect(MinimumAge, "Month") &
+             parse_number(MinimumAge) >= 12 ~ floor(parse_number(MinimumAge) / 12),
+           str_detect(MinimumAge, "Year") ~ parse_number(MinimumAge),
+           TRUE ~ NA_real_
+         ),
+         MaximumAge_clean = case_when(
+           str_detect(MaximumAge, "Minute|Hour|Day|Week") ~ 0,
+           str_detect(MaximumAge, "Month") &
+             parse_number(MaximumAge) < 12 ~ 0,
+           str_detect(MaximumAge, "Month") &
+             parse_number(MaximumAge) >= 12 ~ floor(parse_number(MaximumAge) / 12),
+           str_detect(MaximumAge, "Year") ~ parse_number(MaximumAge),
+           TRUE ~ NA_real_
+         )) |> 
+  filter(start_year <= 2021)
+
+ctgov_data_clean |> saveRDS("data/ctgov_data_clean.rds")
+```
+
+```{r}
+#| label: read-clean-data
+
+ctgov_data_clean <- readRDS("data/ctgov_data_clean.rds")
+```
+
+ClinicalTrials.gov only returns information for up to 1000 studies per query, so I had to build a custom function on top of the API to iteratively get the maximum number of studies for each area. To avoid overwhelming their servers or hitting any request limits, I also built in a delay of 5 seconds per query. After waiting ~15 min, I finally had the raw data:
+
+:::{.column-margin}
+
+List of the clinical trial record's fields queried:
+
+```{r}
+#| results: asis
+
+study_fields <- c("NCTId", "OfficialTitle", "BriefSummary", "Condition", "StudyType", "Phase", "Gender", "MinimumAge", "MaximumAge", "LeadSponsorName", "EnrollmentCount", "DesignInterventionModel", "DesignPrimaryPurpose", "ArmGroupInterventionName", "HealthyVolunteers", "LocationCountry", "StartDate", "CompletionDate", "WhyStopped", "RetractionPMID")
+
+study_fields |> pander::pandoc.list()
+```
+:::
+
+```{r}
+#| label: therapeutic-areas-n-studies-summary-table
+
+ctgov_data_clean |> 
+  count(nov_therapeutic_area, name = "# of clinical trials") |> 
+  rename("Therapeutic area" = nov_therapeutic_area) |> 
+  gt() |> 
+  gt_theme_538()
+```
+
+It's important to consider, however, that in some cases two different searches return the same clinical trial record (for example, a clinical trial about the effect of COVID-19 on the heart would be repeated two times, as it belongs to two different therapeutic areas). The number of unique studies retrieved is 127,712, which represents a remarkable `r round(127712/428103*100, digits = 1)`% of ClinicalTrials.gov's total of 428,103 registered studies.
+
+# Data visualization {#sec-data-visualization}
+
+In this section I will explore different ways of summarizing and visualizing the information obtained in the previous section. The main tool used is `ggplot2`, the excellent R package for creating highly-customizable publication-ready graphics, but other, more interactive methods are also touched upon.
+
+## Number of clinical trials for each therapeutic area over time
+
+The best way to get a good grasp on the kind of data that we have is to represent how the number of clinical trials evolves over time. This is a situation where using an interactive plot makes a lot of sense, because we may want to just zoom in on a particular time range, or represent the Y axis on the log scale to better appreciate the differences between the number of trials started in each therapeutic area.
+
+The cool thing about the recently released Quarto publishing system is that we can use a lot different data science-oriented programming languages and frameworks in the same document, like R, Python, D3.js or, in this case Observable[^1]:
+
+[^1]: Which is also developed by the creator of D3.js, Michael Bostock.
+
+```{r}
+#| label: define_ojs-data
+
+ctgov_data_clean |> 
+  count(start_year, nov_therapeutic_area) |> 
+  ojs_define(n_studies_by_year = _)
+```
+
+```{ojs}
+//| code-fold: false
+import { interval } from "@mootari/range-slider@1781"
+```
+
+```{ojs}
+//| panel: input
+//| code-fold: false
+
+viewof start_year_selected = interval([2010, 2021], {
+  step: 1,
+  value: [2010, 2021],
+  label: "Years selected",
+})
+viewof y_axis_type = Inputs.toggle({label: "Log Y axis", values: ["log", "linear"]})
+```
+
+:::{.column-screen-inset-right}
+
+```{ojs}
+//| code-fold: false
+
+filtered = transpose(n_studies_by_year).filter(function(nstudies) {
+  return start_year_selected[0] <= nstudies.start_year &&
+         start_year_selected[1] >= nstudies.start_year;
+})
+
+Plot.plot({
+  style: "overflow: visible;",
+  y: {
+    type: y_axis_type,
+    grid: true,
+    label: "# of clinical trials started"
+  },
+  x: {
+    tickFormat: d3.format(".0f"),
+    label: "Start year"
+  },
+  marks: [
+    Plot.ruleY([0]),
+    Plot.line(filtered, {
+      x: "start_year", 
+      y: "n",
+      stroke: "nov_therapeutic_area"
+    }),
+    Plot.text(filtered, Plot.selectLast({
+      x: "start_year",
+      y: "n",
+      z: "nov_therapeutic_area",
+      text: "nov_therapeutic_area",
+      textAnchor: "start",
+      dx: 3
+    }))
+  ]
+})
+```
+
+:::
+
+We can already observe a trend in this plot that will be a constant throughout the analysis: the incredible effect of COVID-19 on the number of clinical trials in the *Respiratory* therapeutic area. No less remarkable is the dip experienced by almost every other therapeutic area, as a result of the trials that had to be paused or outright stopped during the pandemic.
+
+### Getting more detail with heatmaps
+
+Heatmaps are also a great way of detecting trends for time-dependent variables at the month level. Thanks to the `plotly` graphing library we can also make them interactive:
+
+```{r}
+#| label: clinical-trials-heatmap
+#| column: body-outset
+#| fig-width: 6
+#| fig-height: 5
+
+plot_heatmap <- 
+  ctgov_data_clean |> 
+  distinct(NCTId, .keep_all = TRUE) |> 
+  mutate(start_month = month(StartDate_clean, label = TRUE, abbr = FALSE, locale = "en_US.UTF-8")) |> 
+  count(start_year, start_month, name = "n_studies") |> 
+  ggplot(aes(x = start_year, y = start_month, text = paste0("<b>Start year:</b> ", start_year,
+                                                            "<br><b>Month: </b>", start_month,
+                                                            "<br><b># Clinical trials:</b> ", n_studies))) +
+  geom_tile(aes(fill = n_studies)) +
+  scale_color_identity() +
+  scale_x_continuous(breaks = 2010:2021, position = "top") +
+  scale_y_discrete(limits = rev) +
+  scale_fill_viridis_c(option = "inferno") +
+  labs(title = "The number of clinical trials has increased in the last years",
+       x = NULL,
+       y = NULL,
+       fill = "# Clinical trials")
+
+ggplotly(plot_heatmap,
+         tooltip = "text")
+```
+
+However, depending on our needs we can create a non-interactive version of the same plot with customized aesthetics, ready to be downloaded in high quality:
+
+```{r}
+#| label: clinical-trials-heatmap-respiratory
+#| layout-ncol: 2
+#| column: page
+#| fig-width: 7
+#| fig-height: 5
+#| fig-cap: 
+#|   - "Evolution of clinical trials during 2010-2021 for all therapeutic areas."
+#|   - "Evolution of clinical trials during 2010-2021 in the *Respiratory* therapeutic area."
+
+ctgov_data_clean |> 
+  distinct(NCTId, .keep_all = TRUE) |> 
+  mutate(start_month = month(StartDate_clean, label = TRUE, abbr = FALSE, locale = "en_US.UTF-8")) |> 
+  count(start_year, start_month, name = "n_studies") |> 
+  ggplot(aes(x = start_year, y = start_month, text = paste0("<b>Start year:</b> ", start_year,
+                                                            "<br><b>Month: </b>", start_month,
+                                                            "<br><b># Clinical trials:</b> ", n_studies))) +
+  geom_tile(aes(fill = n_studies)) +
+  scale_color_identity() +
+  scale_x_continuous(breaks = 2010:2021, position = "top") +
+  scale_y_discrete(limits = rev) +
+  scale_fill_viridis_c(option = "inferno") +
+  labs(title = "The number of clinical trials has increased in the last years",
+       x = NULL,
+       y = NULL,
+       fill = "# Clinical trials")
+
+ctgov_data_clean |> 
+  filter(nov_therapeutic_area == "Respiratory") |> 
+  mutate(start_month = month(StartDate_clean, label = TRUE, abbr = FALSE, locale = "en_US.UTF-8")) |> 
+  count(start_year, start_month, name = "n_studies") |> 
+  ggplot(aes(x = start_year, y = start_month)) +
+  geom_tile(aes(fill = n_studies)) +
+  geom_text(aes(label = n_studies, col = ifelse(n_studies < 200, "white", "black"))) +
+  scale_color_identity() +
+  scale_x_continuous(breaks = 2010:2021, position = "top") +
+  scale_y_discrete(limits = rev) +
+  scale_fill_viridis_c(option = "inferno") +
+  labs(title = "Effect of COVID-19 on the # of clinical trials\nfor respiratory diseases",
+       x = NULL,
+       y = NULL,
+       fill = "# Clinical trials")
+```
+
+Once again, we can make some tentative observations about these data:
+
+* The number of clinical trials for respiratory diseases in 2020 continues the same previous trend at the start of the year, until april, when the number of started studies explodes in comparison with any previous moment since 2010. From this point on, this trend of increased studies in this area continues until the end of the year.
+
+* Conversely, the overall number of clinical trials for all therapeutic areas diminishes at the start of the year, for the reasons stated before. Interestingly, this trend reverses during the summer, probably as a result of more clinical trials being developed to treat the effects of COVID-19 on different organ systems other than the respiratory system.
+
+## Top 10 lead sponsors by therapeutic area
+
+ClinicalTrials.gov also makes available the lead sponsor of each clinical trial, which lets us plot the top 10 sponsors by therapeutic area. Novartis consistently ranks in the top 5 sponsors[^2], with the exception of *Tropical Diseases*.
+
+[^2]: Although it's important to note that this variable requires extensive data cleaning, as the same sponsor can be written in different ways.
+
+:::{.column-page-inset}
+
+```{r}
+#| label: top-10-lead-sponsors-therapeutic-area
+#| fig-width: 11
+#| fig-height: 10
+
+ctgov_data_clean |> 
+  distinct(NCTId, .keep_all = TRUE) |> 
+  mutate(LeadSponsorName = case_when(
+    str_detect(LeadSponsorName, "NIAID") ~ "NIAID",
+    str_detect(LeadSponsorName, "Assistance Publique - Hôpitaux de Paris") ~ "Hôpitaux de Paris",
+    str_detect(LeadSponsorName, "Novartis") ~ "Novartis",
+    str_detect(LeadSponsorName, "London School of Hygiene and Tropical Medicine") ~ "LSHTM",
+    str_detect(LeadSponsorName, "Memorial Sloan Kettering Cancer Center") ~ "MSKCC",
+    str_detect(LeadSponsorName, "Children's Hospital Medical Center") ~ "Children's Hospital Medical Center",
+    str_detect(LeadSponsorName, "Johnson & Johnson") ~ "Johnson & Johnson",
+    str_detect(LeadSponsorName, "VA Office of Research and Development") ~ "VA Office of R&D",
+    str_detect(LeadSponsorName, "The Foundation for Orthopaedics and Regenerative Medicine") ~ "The FOREM",
+    TRUE ~ LeadSponsorName
+  )) |> 
+  count(nov_therapeutic_area, LeadSponsorName, sort = TRUE) |> 
+  group_by(nov_therapeutic_area) |> 
+  slice(1:10) |> 
+  ungroup() |> 
+  mutate(is_novartis = if_else(str_detect(LeadSponsorName, "Novartis"), TRUE, FALSE),
+         LeadSponsorName = reorder_within(LeadSponsorName, n, nov_therapeutic_area)) |> 
+  ggplot(aes(x = n, y = LeadSponsorName)) +
+  geom_col(aes(fill = is_novartis), show.legend = FALSE) +
+  facet_wrap(~nov_therapeutic_area, scales = "free", ncol = 2) +
+  scale_fill_manual(values = c("grey35", "#006A9E")) +
+  scale_y_reordered() +
+  labs(title = "Top 10 lead sponsors for each therapeutic area",
+       subtitle = "Data for clinical trials started between 2010-2021",
+       x = "# of clinical trials as lead sponsor",
+       y = "Lead sponsor",
+       caption = "Data from ClinicalTrials.gov")
+```
+
+:::
+
+## Clinical trials around the world
+
+ClinicalTrials.gov provides as well a list of all the participating countries in each clinical trial. Unfortunately, we only get the names of the countries, not their coordinates. After some data wrangling in R, we are able to show an interactive choropleth map of all the countries which have participated in at least one clinical trial since 2010.
+
+:::{.column-margin}
+
+```{r}
+#| label: table-top-5-countries
+#| tbl-cap: "Top 5 countries by # of CTs"
+#| tbl-cap-location: top
+
+ctgov_data_clean |> 
+  distinct(NCTId, .keep_all = TRUE) |> 
+  unnest(cols = LocationCountry) |> 
+  count(LocationCountry, sort = TRUE, name = "# of CTs") |> 
+  rename("Country" = LocationCountry) |> 
+  slice(1:5) |> 
+  mutate(Flag = countrycode(Country, origin = "country.name", destination = "unicode.symbol")) |> 
+  relocate(Flag, .before = Country) |> 
+  gt() |> 
+  gt_theme_538()
+```
+
+:::
+
+Unsurprisingly, the United States and China lead the list of the countries with the highest number of number of clinical trials, followed by France, which has a strong pharmaceutical industry.
+
+```{r}
+#| label: prepare-data-map-studies-by-country-data
+
+worldmap_spdf <- readOGR( 
+  dsn = "data/world_shape_file/", 
+  layer = "TM_WORLD_BORDERS_SIMPL-0.3",
+  verbose = FALSE
+)
+
+# Kosovo is the only country not available on the map
+ctgov_countries_data <- 
+  ctgov_data_clean |> 
+  distinct(NCTId, .keep_all = TRUE) |> 
+  unnest(cols = LocationCountry) |> 
+  count(LocationCountry, sort = TRUE, name = "n_studies") |> 
+  mutate(ISO3 = countrycode(LocationCountry,
+                            origin = "country.name",
+                            destination = "iso3c")) |> 
+  group_by(ISO3) |> 
+  summarize(n_studies = sum(n_studies)) |> 
+  ungroup() |> 
+  mutate(pct_studies_total = round(n_studies/sum(n_studies) * 100, digits = 2))
+
+worldmap_spdf@data <- 
+  worldmap_spdf@data |> 
+  left_join(ctgov_countries_data |> 
+              select(ISO3, n_studies, pct_studies_total),
+            by = "ISO3") |> 
+  mutate(n_studies = replace_na(n_studies, 0),
+         pct_studies_total = replace_na(pct_studies_total, 0))
+```
+
+:::{.column-screen}
+
+```{r}
+#| label: map-studies-by-country-data
+
+color_pal_map <- colorBin(palette = "YlOrRd",
+                      domain = worldmap_spdf@data$n_studies,
+                      bins = c(1, 10, 100, 1000, 5000, 10000, 50000),
+                      na.color = "transparent")
+
+popup_text <- paste0(
+  "<b>Country: </b>", worldmap_spdf@data$NAME, "<br>",
+  "<b># Clinical trials: </b>", worldmap_spdf@data$n_studies,
+  " (", format(worldmap_spdf@data$pct_studies_total, nsmall = 2), "%)"
+)
+
+worldmap_spdf |> 
+  leaflet() |> 
+  addTiles() |> 
+  setView(lat = 10, lng = 0, zoom = 2) %>%
+  addPolygons(fillColor = ~color_pal_map(n_studies),
+              fillOpacity = 0.75,
+              stroke = FALSE,
+              popup = popup_text) |> 
+  addLegend(pal = color_pal_map,
+            values = ~n_studies, opacity = 0.9,
+            title = "# Clinical trials <br> (2010-2021)",
+            position = "bottomleft")
+```
+
+:::
+
+:::{.callout-tip}
+
+Click on each country to get a summary of its number of clinical trials.
+
+:::
+
+## Minimum and maximum ages to participate in a study
+
+There are several ways to visualize the relationship between the minimum and maximum ages to participate in a clinical trial. First, we can just plot the minimum vs. the maximum age, obtaining a useless but nonetheless intriguing graph:
+
+```{r}
+#| label: plot-minimum-vs-maximum-age
+
+ctgov_data_clean |> 
+  distinct(NCTId, .keep_all = TRUE) |> 
+  filter(!is.na(MinimumAge_clean) & !is.na(MaximumAge_clean)) |> 
+  ggplot(aes(x = MaximumAge_clean, y = MinimumAge_clean)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(col = "blue", linetype = "dashed") +
+  annotate("segment",
+           x = 180,
+           y = 30,
+           xend = 198,
+           yend = 18.5,
+           arrow = arrow(length = unit(0.5, "cm")),
+           col = "darkred") +
+  annotate("text",
+           x = 178,
+           y = 37,
+           label = "This is a\nreal study",
+           color = "darkred") +
+  labs(title = "Minimum vs. maximum age to participate",
+       x = "Maximum age (years)",
+       y = "Minimum age (years)",
+       caption = "Data from ClinicalTrials.gov")
+```
+
+* The dots that fall on the dashed blue line correspond to studies where the minimum and maximum age are the same. This makes sense in studies with newborns and babies where the age is 0, but there are actually a handful of clinical trials for adults with the same minimum and maximum ages.
+
+* There is a shocking number of studies where the maximum age is higher than 120[^3].
+
+[^3]: For reference, [the oldest person ever to have lived died at the age of 122.](https://en.wikipedia.org/wiki/List_of_the_verified_oldest_people)
+
+On a more serious note, the ridgelines plot is the perfect way to visualize such a huge amount of data while preserving interpretability:
+
+:::{.column-page-inset}
+
+```{r}
+#| label: plot-age-criteria-data
+#| fig-width: 12
+#| fig-height: 7
+
+ctgov_data_clean |> 
+  filter(!is.na(MinimumAge_clean) & !is.na(MaximumAge_clean)) |> 
+  filter(MaximumAge_clean <= 100) |> 
+  select(NCTId, nov_therapeutic_area, MinimumAge_clean, MaximumAge_clean) |> 
+  pivot_longer(cols = c(MinimumAge_clean, MaximumAge_clean),
+               names_to = "age_variable",
+               values_to = "age_value") |> 
+  mutate(age_variable = if_else(age_variable == "MinimumAge_clean", "Minimum age", "Maximum age"),
+         age_variable = fct_relevel(age_variable, "Minimum age")) |> 
+  ggplot(aes(x = age_value, y = nov_therapeutic_area, fill = nov_therapeutic_area)) +
+  geom_density_ridges(alpha = 0.75, col = NA, show.legend = FALSE) +
+  facet_wrap(~age_variable, scales = "free_x") +
+  scale_x_continuous(breaks = seq(from = 0, to = 100, by = 10)) +
+  scale_y_discrete(limits = rev) +
+  labs(x = "Age (years)",
+       y = NULL,
+       caption = "Data from ClinicalTrials.gov") +
+  theme_ft_rc()
+```
+
+:::
+
+Looking at the minimum age distribution, we can appreciate two distinct peaks across all therapeutic areas: one corresponding to studies probably involving infants (or with a large gap between minimum and maximum ages) and the other to the standard 18 years of age, which is the age of majority/legal age in most countries. It's also worth noting how the *Neuroscience* trials have a unique distribution of minimum ages starting at 50 years old, in accordance with how these diseases tend to develop and show later in life.
+
+With respect to the maximum age, we better see which studies focus on infants. Again, the *Neuroscience* distribution paints a clear picture of the nature of these diseases: on general, they appear either early on (the 5-20 years crest) or later in life (the two peaks at the end).
+
+## Conditions/diseases
+
+Another interesting variable is *Condition*, which is defined by ClinicalTrials.gov as:
+
+> The disease, disorder, syndrome, illness, or injury that is being studied. On ClinicalTrials.gov, conditions may also include other health-related issues, such as lifespan, quality of life, and health risks.
+
+Each study record needs to list at least one condition, with some studies having up to 145 keywords for the variable. The first thing we can do is a similar graph to the lead sponsors's one, where we plot the top 10 conditions in each therapeutic area. It is important to note that extensive data cleaning needs to be performed, because one condition can be written in more than one way.
+
+### Top 10 conditions in each therapeutic area
+
+:::{.column-page-inset}
+
+```{r}
+#| label: top-10-conditions-therapeutic-area
+#| fig-width: 11
+#| fig-height: 10
+
+ctgov_data_clean_conditions <- 
+  ctgov_data_clean |> 
+  unnest(cols = Condition) |> 
+  mutate(Condition = case_when(
+    str_detect(Condition, "Covid-19|covid-19|covid19|COVID19|Covid19") ~ "COVID-19",
+    str_detect(Condition, "Chronic Obstructive Pulmonary Disease|Pulmonary Disease, Chronic Obstructive") ~ "COPD",
+    str_detect(Condition, "Attention Deficit Hyperactivity Disorder") ~ "ADHD",
+    str_detect(Condition, "Non-Small-Cell Lung|Lung Cancer") ~ "Lung Cancer",
+    str_detect(Condition, "Alzheimer") ~ "Alzheimer's Disease",
+    str_detect(Condition, "Parkinson Disease") ~ "Parkinson's Disease",
+    str_detect(Condition, "Multiple Sclerosis") ~ "Multiple Sclerosis",
+    str_detect(Condition, "Diabetes Mellitus, Type 1") ~ "Type 1 Diabetes",
+    str_detect(Condition, "HIV Infections") ~ "HIV",
+    str_detect(Condition, "Malaria") ~ "Malaria",
+    str_detect(Condition, "Tuberculosis") ~ "Tuberculosis",
+    TRUE ~ Condition,
+  ))
+
+ctgov_data_clean_conditions |> 
+  count(nov_therapeutic_area, Condition, sort = TRUE, name = "n_studies") |> 
+  group_by(nov_therapeutic_area) |> 
+  slice(1:10) |> 
+  ungroup() |> 
+  mutate(Condition = reorder_within(Condition, n_studies, nov_therapeutic_area)) |> 
+  ggplot(aes(x = n_studies, y = Condition)) +
+  geom_col(aes(fill = nov_therapeutic_area), show.legend = FALSE) +
+  facet_wrap(~nov_therapeutic_area, scales = "free", ncol = 2) +
+  scale_y_reordered() +
+  labs(title = "Top 10 conditions in each therapeutic area",
+       subtitle = "Data for clinical trials started between 2010-2021",
+       x = "# of clinical trials for the condition",
+       y = NULL,
+       caption = "Data from ClinicalTrials.gov")
+```
+
+:::
+
+### Enrollment distribution for the top 25 conditions by number of clinical trials
+
+We can also study the enrollment numbers for the top 25 conditions, for example, by plotting all the data in the following way, creating a striking chart:
+
+```{r}
+#| label: plot-enrollment-top-25-conditions
+#| column: page
+#| fig-width: 12
+#| fig-height: 10
+#| fig-cap: "Enrollment distribution for the top 25 conditions by # of clinical trials. The vertical black line represents the median enrollment count for each condition."
+#| fig-cap-location: bottom
+
+top_25_conditions <- 
+  ctgov_data_clean_conditions |> 
+  distinct(NCTId, Condition, .keep_all = TRUE) |> 
+  count(Condition, sort = TRUE, name = "n_studies_condition") |> 
+  slice(1:25)
+
+set.seed(1)
+
+ctgov_data_clean_conditions |> 
+  distinct(NCTId, Condition, .keep_all = TRUE) |> 
+  semi_join(top_25_conditions, by = "Condition") |> 
+  mutate(Condition = fct_reorder(Condition, EnrollmentCount_clean, median, na.rm = TRUE)) |> 
+  ggplot(aes(x = EnrollmentCount_clean, y = Condition, fill = Condition)) +
+  geom_jitter(aes(col = Condition), alpha = 0.25, height = 0.3, show.legend = FALSE) +
+  stat_summary(fun = "median", geom = "crossbar", aes(group = Condition), na.rm = TRUE, show.legend = FALSE) +
+  scale_x_log10(labels = number_format(),
+                breaks = 10^(0:6)) +
+  labs(title = "Enrollment distribution for the top 25 conditions by # of clinical trials",
+       subtitle = "Data for clinical trials started between 2010-2021. The vertical black line represents the median enrollment count for each condition",
+       x = "# of enrolled patients",
+       y = NULL,
+       caption = "Data from ClinicalTrials.gov") +
+  theme_ft_rc()
+```
+
+## Phases of clinical trials and early stoppings
+
+By plotting the percentage of studies in each phase we can get a rough estimate of the most difficult areas in which to develop new and effective treatments. *Oncology* and *Cell and Gene Therapy* have the lowest percentages of clinical trials that reach the final phase 4, which is actually in line with [more complex estimations](https://academic.oup.com/biostatistics/article/20/2/273/4817524).
+
+:::{.column-margin}
+
+From [ClinicalTrials.gov's glossary:](https://www.clinicaltrials.gov/ct2/about-studies/glossary)
+
+> There are five phases: Early Phase 1 (formerly listed as Phase 0), Phase 1, Phase 2, Phase 3, and Phase 4. Not Applicable is used to describe trials without FDA-defined phases, including trials of devices or behavioral interventions.
+
+:::
+
+```{r}
+#| label: barplot-clinical-trials-phases
+#| column: page-inset-left
+#| fig-width: 9
+#| fig-height: 4
+
+ctgov_data_clean |> 
+  unnest(cols = Phase) |> 
+  count(nov_therapeutic_area, Phase, name = "n_studies") |> 
+  group_by(nov_therapeutic_area) |>
+  mutate(prop = n_studies / sum(n_studies)) |> 
+  ungroup() |> 
+  mutate(Phase = fct_relevel(Phase, "Not Applicable")) |> 
+  ggplot(aes(x = prop, y = nov_therapeutic_area, fill = Phase)) +
+  geom_col(position = position_stack(reverse = TRUE)) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_discrete(limits = rev) +
+  scale_fill_viridis_d(option = "viridis",
+                       guide = guide_legend(nrow = 1)) +
+  labs(x = NULL,
+       y = NULL) +
+  theme(legend.position = "top")
+```
+
+At the same time, these two therapeutic areas also have the highest percentages of early stoppings:
+
+```{r}
+#| label: table-early-stoppings
+#| tbl-cap: Percentage of clinical trials (2010-2021) stopped early by therapeutic area
+#| tbl-cap-location: top
+
+ctgov_data_clean |> 
+  mutate(stopped = !is.na(WhyStopped)) |> 
+  count(nov_therapeutic_area, stopped, name = "n_studies") |> 
+  group_by(nov_therapeutic_area) |>
+  mutate(prop = n_studies / sum(n_studies)) |> 
+  ungroup() |> 
+  filter(stopped == TRUE) |> 
+  select("Therapeutic area" = nov_therapeutic_area, "% clinical trials stopped" = prop) |> 
+  gt() |> 
+  fmt_percent(columns = `% clinical trials stopped`,
+              decimals = 1) |> 
+  gt_color_rows(`% clinical trials stopped`) |> 
+  gt_theme_538()
+```
+
+# Conclusion
+
+Here's a list, in no particular order, of the main takeaways I learned from this quick project:
+
+* It has helped me develop a new understanding on how to access clinical trials data in a programmatic way that I will be able to reuse in the future for other projects.
+
+* The time constraint has been extremely useful by making me focus on the most effective way to summarize  the variables that caught my interest. On the downside, I haven't had enough time to properly explain in detail each plot as much as I would have liked, maybe by incorporating additional information from relevant papers.
+
+* It has been difficult to establish the right balance between explaining the process and not being too verbose. My initial idea was to expand on how the code was developed and what "tricks" I used to get around some obstacles that arose along the way, but I feel like it would have made the article too long to the detriment of the main objective: showing the data visualizations.
+
+* Although I already knew about ridgeline plots, I had never actually used them before and was surprised at how effective they have been to convey the minimum and maximum ages in an intuitive way, and how easy they were to implement in `ggplot2`.
